@@ -734,55 +734,85 @@ def update_k_data_to_mysql(cnx_engine):
     code_select_str = 'select code from {}'.format(TODAY_CODE_TABLE)
     code_df = get_sql_query_from_mysql(cnx_engine, code_select_str)
 
-    logging.info('\nbegin to update the k data table')
-    for code in code_df[code_df.columns[0]]:
-        code = str(code).zfill(6)
+    for k_table_dict in K_TABLE_LIST:
+        logging.info('Begin to update the {} table\n'.format(k_table_dict['name']))
 
-        # 不能获取今天的数据，即昨天的数据为最新的数据，0点后才更新昨天数据
-        last_trade_date = TradeTimeClass.get_last_trade_day(
-            datetime.datetime.today() - datetime.timedelta(days=1), k_type='D')
-        # 最近测试发现，收盘后，可以获得今天数据，但是加上开始日期参数，就不能获取今天数据，待调查
-        # last_trade_date = TradeTimeClass.get_last_trade_day(datetime.datetime.today(), self.k_dict['type'])
-        end_date_str = last_trade_date.strftime('%Y-%m-%d')
+        for code in code_df[code_df.columns[0]]:
+            code = str(code).zfill(6)
 
-        k_select_str = 'select date, code from {} where code = "{}" order by date desc limit 1'.\
-            format(K_DAY_TABLE, code)
-        last_date_df = get_sql_query_from_mysql(cnx_engine, k_select_str)
+            # 不能获取今天的数据，即昨天的数据为最新的数据，0点后才更新昨天数据
+            # last_trade_date = TradeTimeClass.get_last_trade_day(
+            #     datetime.datetime.today() - datetime.timedelta(days=1), self.k_dict['type'])
+            # 最近测试发现，收盘后，可以获得今天数据，但是加上开始日期或结束日期参数，就不能获取今天数据，待调查
+            last_trade_date = TradeTimeClass.get_last_trade_day(datetime.datetime.today(), k_table_dict['type'])
+            end_date_str = last_trade_date.strftime('%Y-%m-%d')
 
-        if not len(last_date_df):
-            basics_select_str = 'select timeToMarket from {} where code = "{}"'.format(BASICS_TABLE, code)
-            time_to_market_df = get_sql_query_from_mysql(cnx_engine, basics_select_str)
+            k_select_str = 'select date, code from {} where code = "{}" order by date desc limit 1'. \
+                format(k_table_dict['name'], code)
+            last_date_df = get_sql_query_from_mysql(cnx_engine, k_select_str)
+            time_to_market_str = ''
 
-            if len(time_to_market_df) > 0:
-                start_date_str = str(time_to_market_df.iloc[0, 0])
-                if '0' == start_date_str:
-                    # 未上市
+            if not len(last_date_df):
+                basics_select_str = 'select timeToMarket from {} where code = "{}"'.format(BASICS_TABLE, code)
+                time_to_market_df = get_sql_query_from_mysql(cnx_engine, basics_select_str)
+
+                if len(time_to_market_df) > 0:
+                    time_to_market_str = str(time_to_market_df.iloc[0, 0])
+
+                    if '0' == time_to_market_str:
+                        # 未上市
+                        continue
+                    else:
+                        start_date_str = '{}-{}-{}'.format(time_to_market_str[0:4], time_to_market_str[4:6],
+                                                           time_to_market_str[6:])
+                        time_to_market_str = start_date_str
+
+                        # 当月或者当周上市，所以不能获取上周或者上月的数据
+                        if datetime.datetime.strptime(start_date_str, '%Y-%m-%d') \
+                                >= datetime.datetime.strptime(end_date_str, '%Y-%m-%d'):
+                            continue
+                else:
+                    start_date_str = OLDEST_TRADE_DATA
+            else:
+                last_date = str(last_date_df.iloc[0, 0])
+
+                if datetime.datetime.strptime(last_date, '%Y-%m-%d') \
+                        >= datetime.datetime.strptime(end_date_str, '%Y-%m-%d'):
                     continue
                 else:
-                    start_date_str = '{}-{}-{}'.format(start_date_str[0:4], start_date_str[4:6], start_date_str[6:])
+                    datetime_last_date = datetime.datetime.strptime(last_date, '%Y-%m-%d')
+                    next_date = datetime_last_date + datetime.timedelta(days=1)
+                    start_date_str = next_date.strftime('%Y-%m-%d')
+
+            logging.info('code: {}, start_date_str = {}, end_date_str = {}'.format(code, start_date_str, end_date_str))
+            # 对周K和月K，必须加上结束日期，否则为中间日期数据，即这周未到周五，但是返回的数据有到这周当前日期的数据，
+            # 如今天是周三，则返回的最后一条数据是周一到周三的统计数据，这不是想要的数据，所以需要加上结束日期为上周末，
+            # 统计到上周五的数据即可。
+            # 或这个月未到月末，但是返回的最后一条数据是这月当前日期的数据，如今天是20号，
+            # 则返回的数据中有1号到20号的累计统计数据，这不是想要的数据，所以加上结束日期为上月末，统计到上月末的数据即可
+            if 'D' == k_table_dict['type'] and start_date_str != time_to_market_str \
+                    and start_date_str != OLDEST_TRADE_DATA:
+                k_df = get_stock_history_k_data(code, start_date='', end_date='',
+                                                k_type=k_table_dict['type'])
+
+                if len(k_df):
+                    k_df = k_df[k_df['date'] >= start_date_str]
+                else:
+                    logging.info('The k_df[{}] is empty while the code is: {}'.format(k_table_dict['type'], code))
             else:
-                start_date_str = OLDEST_TRADE_DATA
-        else:
-            last_date = str(last_date_df.iloc[0, 0])
+                k_df = get_stock_history_k_data(code, start_date=start_date_str, end_date=end_date_str,
+                                                k_type=k_table_dict['type'])
 
-            if datetime.datetime.strptime(last_date, '%Y-%m-%d') \
-                    >= datetime.datetime.strptime(end_date_str, '%Y-%m-%d'):
-                continue
+            if len(k_df):
+                # 获取df的列
+                k_df_column = list(k_df)
+                k_df_column.insert(0, k_df_column.pop(k_df_column.index(k_df.columns[-1])))  # 把最后一行弹出插入第一行
+                k_df = k_df[k_df_column]
+                k_df.to_sql(k_table_dict['name'], con=cnx_engine, if_exists='append', index=False)
+
+                # self.k_df_lists.append(k_df)
             else:
-                datetime_last_date = datetime.datetime.strptime(last_date, '%Y-%m-%d')
-                next_date = datetime_last_date + datetime.timedelta(days=1)
-                start_date_str = next_date.strftime('%Y-%m-%d')
-
-        logging.info('code: {}, start_date_str = {}, end_date_str = {}'.format(code, start_date_str, end_date_str))
-        k_df = get_stock_history_k_data(code, start_date=start_date_str, end_date=end_date_str,
-                                        k_type='D')
-
-        if len(k_df):
-            # 获取df的列
-            k_df_column = list(k_df)
-            k_df_column.insert(0, k_df_column.pop(k_df_column.index(k_df.columns[-1])))  # 把最后一行弹出插入第一行
-            k_df = k_df[k_df_column]
-            k_df.to_sql(K_DAY_TABLE, con=cnx_engine, if_exists='append', index=False)
+                logging.info('The k_df[{}] is empty while the code is: {}'.format(k_table_dict['type'], code))
 
 
 class GetKDataAsDfToMysqlClass(threading.Thread):
