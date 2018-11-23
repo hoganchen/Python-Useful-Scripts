@@ -9,6 +9,7 @@
 
 import sys
 import time
+import queue
 import pandas
 import random
 import logging
@@ -27,6 +28,7 @@ HOLIDAY_LIST = [20170101, 20170102, 20170127, 20170128, 20170129, 20170130, 2017
                 20180618, 20180924, 20181001, 20181002, 20181003, 20181004, 20181005]
 
 MAX_THREAD_NUM = 50
+THREAD_LOCK = threading.Lock()
 ENABLE_MYSQL_CONNECTOR_FLAG = False
 
 MIN_SLEEP_TIME = 2
@@ -101,19 +103,20 @@ db_settings = {
     'user': 'stck',
     'password': 'stck&sql',
     'host': '127.0.0.1',
-    'database': 'stock_temp',
+    'database': 'stock',
     'port': 3306,
 }
 
 # log level
-LOGGING_LEVEL = logging.DEBUG
+LOGGING_LEVEL = logging.INFO
 
 
 def logging_config(logging_level):
     # log_format = "%(asctime)s - %(levelname)s - %(message)s"
     # log_format = "%(asctime)s [line: %(lineno)d] - %(levelname)s - %(message)s"
     # log_format = "[line: %(lineno)d] - %(levelname)s - %(message)s"
-    log_format = "[%(asctime)s - [File: %(filename)s line: %(lineno)d] - %(levelname)s]: %(message)s"
+    # log_format = "[%(asctime)s - [File: %(filename)s line: %(lineno)d] - %(levelname)s]: %(message)s"
+    log_format = "[%(asctime)s - [line: %(lineno)d] - %(levelname)s]: %(message)s"
     logging.basicConfig(level=logging_level, format=log_format)
 
 
@@ -361,10 +364,15 @@ def get_stock_history_hist_data(code, start_date=None, end_date=None, k_type='D'
             logging.debug('{}'.format(err))
             time.sleep(random.randint(MIN_SLEEP_TIME, MAX_SLEEP_TIME))
         else:
-            if hist_df is not None or len(hist_df) or try_time >= MAX_TRY_TIME:
-                break
-            else:
+            if hist_df is None or 0 == len(hist_df) or try_time < MAX_TRY_TIME:
                 try_time += 1
+            else:
+                break
+
+            # if hist_df is not None or len(hist_df) or try_time >= MAX_TRY_TIME:
+            #     break
+            # else:
+            #     try_time += 1
 
     return hist_df
 
@@ -581,6 +589,21 @@ def get_zz500s_data():
             break
 
     return zz500s_df
+
+
+def df_to_sql_by_threading_lock(df, table, engine):
+    THREAD_LOCK.acquire()
+    df.to_sql(table, con=engine, if_exists='append', index=False)
+    THREAD_LOCK.release()
+
+
+def df_to_sql_by_queue(df_queue, table, engine):
+    while True:
+        df = df_queue.get()
+        if df is None:
+            break
+
+        df.to_sql(table, con=engine, if_exists='append', index=False)
 
 
 def update_today_data_and_code_data_from_today_all_to_mysql(cnx_engine):
@@ -816,13 +839,14 @@ def update_k_data_to_mysql(cnx_engine):
 
 
 class GetKDataAsDfToMysqlClass(threading.Thread):
-    def __init__(self, k_df_lists, last_date_df, basics_table_df, k_dict, code_df, index, engine):
+    def __init__(self, k_df_lists, last_date_df, basics_table_df, k_dict, code_df, df_queue, index, engine):
         threading.Thread.__init__(self)
         self.k_df_lists = k_df_lists
         self.last_date_df = last_date_df
         self.basics_table_df = basics_table_df
         self.k_dict = k_dict
         self.code_df = code_df
+        self.df_queue = df_queue
         self.index = index
         self.engine = engine
 
@@ -915,9 +939,12 @@ class GetKDataAsDfToMysqlClass(threading.Thread):
                 k_df_column = list(k_df)
                 k_df_column.insert(0, k_df_column.pop(k_df_column.index(k_df.columns[-1])))  # 把最后一行弹出插入第一行
                 k_df = k_df[k_df_column]
-                # k_df.to_sql(self.k_dict['name'], con=self.engine, if_exists='append', index=False)
 
-                self.k_df_lists.append(k_df)
+                # k_df.to_sql(self.k_dict['name'], con=self.engine, if_exists='append', index=False)
+                # df_to_sql_by_threading_lock(k_df, self.k_dict['name'], self.engine)
+                self.df_queue.put(k_df)
+
+                # self.k_df_lists.append(k_df)
             else:
                 logging.info('The k_df[{}] is empty while the code is: {}'.format(self.k_dict['type'], code))
 
@@ -973,20 +1000,24 @@ def update_k_data_as_df_to_mysql(cnx_engine):
 
         get_k_data_threads = []
         k_df_lists = []
+        df_queue = queue.Queue()
 
         for thread_index in range(MAX_THREAD_NUM):
             threads = GetKDataAsDfToMysqlClass(k_df_lists, last_date_df, basics_table_df, k_table_dict,
-                                               code_df, thread_index, cnx_engine)
+                                               code_df, df_queue, thread_index, cnx_engine)
             get_k_data_threads.append(threads)
 
         for thread_index in range(len(get_k_data_threads)):
             get_k_data_threads[thread_index].start()
 
+        df_to_sql_thread = threading.Thread(target=df_to_sql_by_queue,
+                                            args=(df_queue, k_table_dict['name'], cnx_engine))
+        df_to_sql_thread.start()
+
         for thread_index in range(len(get_k_data_threads)):
             get_k_data_threads[thread_index].join()
 
-        for k_df in k_df_lists:
-            k_df.to_sql(k_table_dict['name'], con=cnx_engine, if_exists='append', index=False)
+        df_to_sql_thread.join()
 
 
 def update_hist_data_to_mysql(cnx_engine):
@@ -1028,11 +1059,14 @@ def update_hist_data_to_mysql(cnx_engine):
 
 
 class GetHistDataAsDfToMysqlClass(threading.Thread):
-    def __init__(self, hist_df_lists, hist_dict, code_df, index, engine):
+    def __init__(self, hist_df_lists, last_date_df, basics_table_df, hist_dict, code_df, df_queue, index, engine):
         threading.Thread.__init__(self)
         self.hist_df_lists = hist_df_lists
+        self.last_date_df = last_date_df
+        self.basics_table_df = basics_table_df
         self.hist_dict = hist_dict
         self.code_df = code_df
+        self.df_queue = df_queue
         self.index = index
         self.engine = engine
 
@@ -1057,15 +1091,17 @@ class GetHistDataAsDfToMysqlClass(threading.Thread):
             last_trade_date = TradeTimeClass.get_last_trade_day(datetime.datetime.today(), self.hist_dict['type'])
             end_date_str = last_trade_date.strftime('%Y-%m-%d')
 
-            hist_select_str = 'select date, code from {} where code = "{}" order by date desc limit 1'.\
-                format(self.hist_dict['name'], code)
-            code_last_date_df = get_sql_query_from_mysql(self.engine, hist_select_str)
+            # hist_select_str = 'select date, code from {} where code = "{}" order by date desc limit 1'.\
+            #     format(self.hist_dict['name'], code)
+            # code_last_date_df = get_sql_query_from_mysql(self.engine, hist_select_str)
+            code_last_date_df = self.last_date_df[self.last_date_df['code'] == code]
 
             if not len(code_last_date_df):
                 start_date_str = None
 
-                basics_select_str = 'select timeToMarket from {} where code = "{}"'.format(BASICS_TABLE, code)
-                time_to_market_df = get_sql_query_from_mysql(self.engine, basics_select_str)
+                # basics_select_str = 'select timeToMarket from {} where code = "{}"'.format(BASICS_TABLE, code)
+                # time_to_market_df = get_sql_query_from_mysql(self.engine, basics_select_str)
+                time_to_market_df = self.basics_table_df[['timeToMarket']][self.basics_table_df['code'] == code]
 
                 if len(time_to_market_df) > 0:
                     time_to_market_str = str(time_to_market_df.iloc[0, 0])
@@ -1117,7 +1153,10 @@ class GetHistDataAsDfToMysqlClass(threading.Thread):
             if hist_df is not None and len(hist_df):
                 hist_df.insert(0, 'date', hist_df.index)
                 hist_df.insert(1, 'code', code)
-                hist_df.to_sql(self.hist_dict['name'], con=self.engine, if_exists='append', index=False)
+
+                # hist_df.to_sql(self.hist_dict['name'], con=self.engine, if_exists='append', index=False)
+                # df_to_sql_by_threading_lock(hist_df, self.hist_dict['name'], self.engine)
+                self.df_queue.put(hist_df)
 
                 # self.hist_df_lists.append(hist_df)
             else:
@@ -1130,22 +1169,33 @@ class GetHistDataAsDfToMysqlClass(threading.Thread):
 def update_hist_data_as_df_to_mysql(cnx_engine):
     code_select_str = 'select code from {}'.format(TODAY_CODE_TABLE)
     code_df = get_sql_query_from_mysql(cnx_engine, code_select_str)
+    basics_table_df = get_basics_table_df(cnx_engine)
 
     for hist_table_dict in HIST_TABLE_LIST:
         logging.info('Begin to update the {} table\n'.format(hist_table_dict['name']))
 
+        last_date_df = get_last_trade_date_df(cnx_engine, hist_table_dict['name'])
+
         get_hist_data_threads = []
         hist_df_lists = []
+        df_queue = queue.Queue()
 
         for thread_index in range(MAX_THREAD_NUM):
-            threads = GetHistDataAsDfToMysqlClass(hist_df_lists, hist_table_dict, code_df, thread_index, cnx_engine)
+            threads = GetHistDataAsDfToMysqlClass(hist_df_lists, last_date_df, basics_table_df,
+                                                  hist_table_dict, code_df, df_queue, thread_index, cnx_engine)
             get_hist_data_threads.append(threads)
 
         for thread_index in range(len(get_hist_data_threads)):
             get_hist_data_threads[thread_index].start()
 
+        df_to_sql_thread = threading.Thread(target=df_to_sql_by_queue,
+                                            args=(df_queue, hist_table_dict['name'], cnx_engine))
+        df_to_sql_thread.start()
+
         for thread_index in range(len(get_hist_data_threads)):
             get_hist_data_threads[thread_index].join()
+
+        df_to_sql_thread.join()
 
 
 class GetHDataAsDfToMysqlClass(threading.Thread):
@@ -1252,13 +1302,11 @@ def main():
     # update_concept_data_to_mysql(mysql_engine)
     # update_area_data_to_mysql(mysql_engine)
 
-    # get_last_trade_date_df(mysql_engine, K_DAY_TABLE)
-
     # update_k_data_to_mysql(mysql_engine)
-    update_k_data_as_df_to_mysql(mysql_engine)
+    # update_k_data_as_df_to_mysql(mysql_engine)
 
     # update_hist_data_to_mysql(mysql_engine)
-    # update_hist_data_as_df_to_mysql(mysql_engine)
+    update_hist_data_as_df_to_mysql(mysql_engine)
 
     # 该接口获取数据较慢，所以最好少用，就比k_data多了一个成交金额
     # update_h_data_as_df_to_mysql(mysql_engine)
@@ -1269,13 +1317,13 @@ def main():
 if __name__ == "__main__":
     logging_config(LOGGING_LEVEL)
 
-    logging.info('\nScript start execution at {}'.format(datetime.datetime.now()))
+    logging.info('Script start execution at {}\n'.format(datetime.datetime.now()))
 
     time_start = time.time()
     main()
 
-    logging.info('\n\nScript end execution at {}'.format(datetime.datetime.now()))
-    logging.info('\nTotal Elapsed Time: {} seconds\n'.format(time.time() - time_start))
+    logging.info('Script end execution at {}\n'.format(datetime.datetime.now()))
+    logging.info('Total Elapsed Time: {} seconds\n'.format(time.time() - time_start))
 
 ```
 
